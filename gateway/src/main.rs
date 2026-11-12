@@ -1,4 +1,12 @@
 use anyhow::Result;
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
 use shadowtunnel_protocol::{decode, encode, Message, MAX_DATAGRAM, MAX_FRAME};
 use std::{
     collections::HashMap,
@@ -24,6 +32,8 @@ struct Config {
     cert: Option<String>,
     key: Option<String>,
     tunnel: String,
+    api_bind: String,
+    api_token: Option<String>,
 }
 impl Config {
     fn from_env() -> Result<Self> {
@@ -42,6 +52,8 @@ impl Config {
             cert,
             key,
             tunnel: env::var("SHADOW_TUNNEL").unwrap_or_else(|_| "default".into()),
+            api_bind: env::var("SHADOW_API_BIND").unwrap_or_else(|_| "127.0.0.1:9100".into()),
+            api_token: env::var("SHADOW_API_TOKEN").ok(),
         })
     }
 }
@@ -50,6 +62,172 @@ struct Agent {
     tx: mpsc::Sender<Message>,
 }
 type Registry = Arc<RwLock<HashMap<String, Agent>>>;
+
+#[derive(Clone, Default)]
+struct TunnelMeta {
+    requested: bool,
+}
+type Tunnels = Arc<RwLock<HashMap<String, TunnelMeta>>>;
+#[derive(Clone)]
+struct ApiState {
+    cfg: Config,
+    registry: Registry,
+    tunnels: Tunnels,
+}
+#[derive(Deserialize)]
+struct CreateTunnel {
+    tunnel: String,
+    token: Option<String>,
+}
+#[derive(Serialize)]
+struct TunnelView {
+    tunnel: String,
+    online: bool,
+    requested: bool,
+    tcp_address: Option<String>,
+    udp_address: Option<String>,
+}
+#[derive(Serialize)]
+struct Health {
+    status: &'static str,
+}
+
+fn authorized(headers: &HeaderMap, cfg: &Config) -> bool {
+    match &cfg.api_token {
+        Some(token) => {
+            headers
+                .get("SHADOW_API_TOKEN")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| {
+                    headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                })
+                == Some(token)
+        }
+        None => false,
+    }
+}
+fn unauthorized() -> impl IntoResponse {
+    (StatusCode::UNAUTHORIZED, "unauthorized")
+}
+async fn health() -> Json<Health> {
+    Json(Health { status: "ok" })
+}
+async fn tunnels(State(state): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers, &state.cfg) {
+        return (StatusCode::UNAUTHORIZED, Json(Vec::<TunnelView>::new())).into_response();
+    }
+    let metas = state.tunnels.read().await;
+    let registry = state.registry.read().await;
+    let views = metas
+        .iter()
+        .map(|(name, meta)| TunnelView {
+            tunnel: name.clone(),
+            online: registry.contains_key(name),
+            requested: meta.requested,
+            tcp_address: registry.contains_key(name).then(|| state.cfg.bind.clone()),
+            udp_address: registry
+                .contains_key(name)
+                .then(|| state.cfg.udp_bind.clone()),
+        })
+        .collect::<Vec<_>>();
+    Json(views).into_response()
+}
+async fn create_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateTunnel>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.cfg) {
+        return unauthorized().into_response();
+    }
+    if body
+        .token
+        .as_deref()
+        .is_some_and(|token| token != state.cfg.token)
+    {
+        return unauthorized().into_response();
+    }
+    if body.tunnel.is_empty() || body.tunnel.len() > 128 || body.tunnel.contains('/') {
+        return (StatusCode::BAD_REQUEST, "invalid tunnel").into_response();
+    }
+    state
+        .tunnels
+        .write()
+        .await
+        .entry(body.tunnel.clone())
+        .or_default();
+    let online = state.registry.read().await.contains_key(&body.tunnel);
+    Json(TunnelView {
+        tunnel: body.tunnel,
+        online,
+        requested: false,
+        tcp_address: online.then(|| state.cfg.bind.clone()),
+        udp_address: online.then(|| state.cfg.udp_bind.clone()),
+    })
+    .into_response()
+}
+async fn set_tunnel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(tunnel): Path<String>,
+    requested: bool,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.cfg) {
+        return unauthorized().into_response();
+    }
+    let mut tunnels = state.tunnels.write().await;
+    let Some(meta) = tunnels.get_mut(&tunnel) else {
+        return (StatusCode::NOT_FOUND, "tunnel not found").into_response();
+    };
+    meta.requested = requested;
+    drop(tunnels);
+    status(State(state), headers, Path(tunnel))
+        .await
+        .into_response()
+}
+async fn connect(
+    state: State<ApiState>,
+    headers: HeaderMap,
+    path: Path<String>,
+) -> impl IntoResponse {
+    set_tunnel(state, headers, path, true).await
+}
+async fn disconnect(
+    state: State<ApiState>,
+    headers: HeaderMap,
+    path: Path<String>,
+) -> impl IntoResponse {
+    set_tunnel(state, headers, path, false).await
+}
+async fn status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(tunnel): Path<String>,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.cfg) {
+        return unauthorized().into_response();
+    }
+    let meta = state.tunnels.read().await.get(&tunnel).cloned();
+    let Some(meta) = meta else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"tunnel not found"})),
+        )
+            .into_response();
+    };
+    let online = state.registry.read().await.contains_key(&tunnel);
+    Json(TunnelView {
+        tunnel,
+        online,
+        requested: meta.requested,
+        tcp_address: online.then(|| state.cfg.bind.clone()),
+        udp_address: online.then(|| state.cfg.udp_bind.clone()),
+    })
+    .into_response()
+}
 async fn read_msg(s: &mut TcpStream) -> Result<Message> {
     let mut h = [0; 4];
     s.read_exact(&mut h).await?;
@@ -234,6 +412,26 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let _tls = (cfg.tls, cfg.cert.clone(), cfg.key.clone());
     let registry = Arc::new(RwLock::new(HashMap::new()));
+    let tunnel_state = Arc::new(RwLock::new(HashMap::from([(
+        cfg.tunnel.clone(),
+        TunnelMeta::default(),
+    )])));
+    let api_state = ApiState {
+        cfg: cfg.clone(),
+        registry: registry.clone(),
+        tunnels: tunnel_state.clone(),
+    };
+    let api = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/tunnels", get(tunnels).post(create_tunnel))
+        .route("/api/tunnels/:tunnel/connect", post(connect))
+        .route("/api/tunnels/:tunnel/disconnect", post(disconnect))
+        .route("/api/tunnels/:tunnel/status", get(status))
+        .with_state(api_state);
+    let api_listener = tokio::net::TcpListener::bind(&cfg.api_bind).await?;
+    tokio::spawn(async move {
+        let _ = axum::serve(api_listener, api).await;
+    });
     let pending = Arc::new(RwLock::new(HashMap::new()));
     let ids = Arc::new(AtomicU32::new(1));
     let agents = TcpListener::bind(&cfg.agent_bind).await?;
