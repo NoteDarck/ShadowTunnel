@@ -7,6 +7,13 @@ use tokio::{
     sync::{mpsc, Mutex},
     time::sleep,
 };
+fn valid_type(kind: &str) -> Result<()> {
+    if kind != "java" {
+        anyhow::bail!("unsupported Minecraft type: {kind}")
+    }
+    Ok(())
+}
+
 fn valid_destination(addr: &str) -> Result<()> {
     let host = addr
         .rsplit_once(':')
@@ -69,19 +76,16 @@ async fn run(endpoint: String, token: String, tunnel: String, destination: Strin
                         let (mut sr, mut sw) = socket.into_split();
                         let (tx, mut rx) = mpsc::channel(64);
                         streams.lock().await.insert(id, tx);
+                        let streams_writer = streams.clone();
                         tokio::spawn(async move {
                             while let Some(m) = rx.recv().await {
-                                if sw
-                                    .write_all(match m {
-                                        Message::Data { ref bytes, .. } => bytes,
-                                        _ => &[],
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+                                if let Message::Data { bytes, .. } = m {
+                                    if sw.write_all(&bytes).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
+                            streams_writer.lock().await.remove(&id);
                         });
                         let sender2 = out_tx.clone();
                         tokio::spawn(async move {
@@ -103,8 +107,7 @@ async fn run(endpoint: String, token: String, tunnel: String, destination: Strin
                             }
                             let _ = sender2.send(Message::Close { id }).await;
                         });
-                        out_tx.send(Message::OpenOk { id }).await?;
-                    },
+                    }
                     Err(_) => {
                         out_tx
                             .send(Message::OpenError {
@@ -131,14 +134,15 @@ async fn run(endpoint: String, token: String, tunnel: String, destination: Strin
             _ => {}
         }
     }
-    Ok(())
 }
 #[tokio::main]
 async fn main() -> Result<()> {
     let endpoint = env::var("SHADOW_GATEWAY").unwrap_or_else(|_| "127.0.0.1:9000".into());
     let token = env::var("SHADOW_TOKEN")?;
     let tunnel = env::var("SHADOW_TUNNEL").unwrap_or_else(|_| "default".into());
-    let destination = env::var("SHADOW_DESTINATION").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let minecraft_type = env::var("SHADOW_MINECRAFT_TYPE").unwrap_or_else(|_| "java".into());
+    valid_type(&minecraft_type)?;
+    let destination = env::var("SHADOW_DESTINATION").unwrap_or_else(|_| "127.0.0.1:25565".into());
     loop {
         if run(
             endpoint.clone(),

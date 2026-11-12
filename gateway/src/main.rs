@@ -22,6 +22,7 @@ struct Config {
     tls: bool,
     cert: Option<String>,
     key: Option<String>,
+    tunnel: String,
 }
 impl Config {
     fn from_env() -> Result<Self> {
@@ -38,6 +39,7 @@ impl Config {
             tls,
             cert,
             key,
+            tunnel: env::var("SHADOW_TUNNEL").unwrap_or_else(|_| "default".into()),
         })
     }
 }
@@ -100,14 +102,14 @@ async fn public(
     registry: Registry,
     pending: Pending,
     ids: Arc<AtomicU32>,
+    tunnel: String,
 ) -> Result<()> {
-    let (tunnel, agent) = registry
+    let agent = registry
         .read()
         .await
-        .iter()
-        .next()
-        .map(|(t, a)| (t.clone(), a.tx.clone()))
-        .ok_or_else(|| anyhow::anyhow!("no agent"))?;
+        .get(&tunnel)
+        .map(|a| a.tx.clone())
+        .ok_or_else(|| anyhow::anyhow!("configured tunnel unavailable"))?;
     let id = ids.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel(64);
     pending.write().await.insert((tunnel.clone(), id), tx);
@@ -172,6 +174,12 @@ async fn main() -> Result<()> {
     });
     loop {
         let (s, _) = public_listener.accept().await?;
-        tokio::spawn(public(s, registry.clone(), pending.clone(), ids.clone()));
+        tokio::spawn(public(
+            s,
+            registry.clone(),
+            pending.clone(),
+            ids.clone(),
+            cfg.tunnel.clone(),
+        ));
     }
 }
