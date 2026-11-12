@@ -1,0 +1,157 @@
+use anyhow::Result;
+use shadowtunnel_protocol::{decode, encode, Message, MAX_FRAME};
+use std::{collections::HashMap, env, net::IpAddr, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::{mpsc, Mutex},
+    time::sleep,
+};
+fn valid_destination(addr: &str) -> Result<()> {
+    let host = addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("destination must be host:port"))?
+        .0;
+    let ip: IpAddr = host.parse()?;
+    if !ip.is_loopback() {
+        anyhow::bail!("destination must be loopback")
+    }
+    Ok(())
+}
+async fn read_msg(s: &mut (impl AsyncReadExt + Unpin)) -> Result<Message> {
+    let mut h = [0; 4];
+    s.read_exact(&mut h).await?;
+    let n = u32::from_be_bytes(h) as usize;
+    if n > MAX_FRAME {
+        anyhow::bail!("frame too large")
+    }
+    let mut b = vec![0; n + 4];
+    b[..4].copy_from_slice(&h);
+    s.read_exact(&mut b[4..]).await?;
+    Ok(decode(&b)?)
+}
+async fn write_msg(s: &mut (impl AsyncWriteExt + Unpin), m: &Message) -> Result<()> {
+    s.write_all(&encode(m)?).await?;
+    Ok(())
+}
+async fn run(endpoint: String, token: String, tunnel: String, destination: String) -> Result<()> {
+    valid_destination(&destination)?;
+    let mut gateway = TcpStream::connect(endpoint).await?;
+    write_msg(&mut gateway, &Message::Auth { token, tunnel }).await?;
+    if read_msg(&mut gateway).await? != Message::AuthOk {
+        anyhow::bail!("authentication failed")
+    }
+    let (mut rd, mut wr) = gateway.into_split();
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(128);
+    let _writer_handle = tokio::spawn(async move {
+        while let Some(m) = out_rx.recv().await {
+            write_msg(&mut wr, &m).await?
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Message>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let heartbeat = out_tx.clone();
+    let _heartbeat_handle = tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(15)).await;
+            if heartbeat.send(Message::Heartbeat).await.is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        match read_msg(&mut rd).await? {
+            Message::Open { id } => {
+                let socket = TcpStream::connect(&destination).await;
+                match socket {
+                    Ok(socket) => {
+                        let (mut sr, mut sw) = socket.into_split();
+                        let (tx, mut rx) = mpsc::channel(64);
+                        streams.lock().await.insert(id, tx);
+                        tokio::spawn(async move {
+                            while let Some(m) = rx.recv().await {
+                                if sw
+                                    .write_all(match m {
+                                        Message::Data { ref bytes, .. } => bytes,
+                                        _ => &[],
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        let sender2 = out_tx.clone();
+                        tokio::spawn(async move {
+                            let mut b = vec![0; MAX_FRAME / 2];
+                            while let Ok(n) = sr.read(&mut b).await {
+                                if n == 0 {
+                                    break;
+                                }
+                                if sender2
+                                    .send(Message::Data {
+                                        id,
+                                        bytes: b[..n].to_vec(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            let _ = sender2.send(Message::Close { id }).await;
+                        });
+                        out_tx.send(Message::OpenOk { id }).await?;
+                    },
+                    Err(_) => {
+                        out_tx
+                            .send(Message::OpenError {
+                                id,
+                                reason: "destination unavailable".into(),
+                            })
+                            .await?;
+                        continue;
+                    }
+                }
+                out_tx.send(Message::OpenOk { id }).await?;
+            }
+            Message::Data { id, bytes } => {
+                if let Some(tx) = streams.lock().await.get(&id) {
+                    tx.send(Message::Data { id, bytes }).await?
+                }
+            }
+            Message::Close { id } => {
+                streams.lock().await.remove(&id);
+                out_tx.send(Message::Close { id }).await?
+            }
+            Message::Heartbeat => out_tx.send(Message::HeartbeatAck).await?,
+            Message::HeartbeatAck => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+#[tokio::main]
+async fn main() -> Result<()> {
+    let endpoint = env::var("SHADOW_GATEWAY").unwrap_or_else(|_| "127.0.0.1:9000".into());
+    let token = env::var("SHADOW_TOKEN")?;
+    let tunnel = env::var("SHADOW_TUNNEL").unwrap_or_else(|_| "default".into());
+    let destination = env::var("SHADOW_DESTINATION").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    loop {
+        if run(
+            endpoint.clone(),
+            token.clone(),
+            tunnel.clone(),
+            destination.clone(),
+        )
+        .await
+        .is_ok()
+        {
+            break;
+        }
+        sleep(Duration::from_secs(2)).await
+    }
+    Ok(())
+}

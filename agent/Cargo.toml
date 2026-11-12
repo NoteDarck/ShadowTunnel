@@ -1,0 +1,9 @@
+[package]
+name = "shadowtunnel-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shadowtunnel-protocol = { path = "../protocol" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
