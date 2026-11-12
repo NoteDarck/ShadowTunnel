@@ -20,6 +20,10 @@ FASE 2 suporta Minecraft Java via TCP. FASE 3 adiciona Minecraft Bedrock via UDP
 
 Protocolo: `protocol/PROTOCOL.md`.
 
+## Plugin Paper
+
+Compile o plugin em `plugin/` com Java 21 e copie `build/libs/ShadowTunnel-1.0.0.jar` para `plugins/`. Configure `plugins/ShadowTunnel/config.yml` com `api-url`, `api-token`, `tunnel.name`, `local-type` e `local-destination`. Comandos: `/shadowtunnel status`, `/shadowtunnel connect`, `/shadowtunnel disconnect` e `/shadowtunnel info`; exigem `shadowtunnel.admin`.
+
 ## Verificação
 
 ```sh

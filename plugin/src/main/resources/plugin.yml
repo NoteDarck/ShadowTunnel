@@ -1,0 +1,15 @@
+name: ShadowTunnel
+version: '1.0.0'
+main: com.shadowtunnel.plugin.ShadowTunnelPlugin
+api-version: '1.21'
+author: ShadowTunnel
+commands:
+  shadowtunnel:
+    description: Manage the ShadowTunnel connection
+    usage: /shadowtunnel <status|connect|disconnect|info>
+    permission: shadowtunnel.admin
+    aliases: [st]
+permissions:
+  shadowtunnel.admin:
+    description: Manage ShadowTunnel
+    default: op

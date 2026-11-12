@@ -1,0 +1,6 @@
+tunnel:
+  name: default
+api-url: http://127.0.0.1:9100
+api-token: ''
+local-type: java
+local-destination: 127.0.0.1:25565
