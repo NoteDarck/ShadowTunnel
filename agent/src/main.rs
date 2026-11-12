@@ -1,15 +1,22 @@
 use anyhow::Result;
-use shadowtunnel_protocol::{decode, encode, Message, MAX_FRAME};
+use shadowtunnel_protocol::{decode, encode, Message, MAX_DATAGRAM, MAX_FRAME};
 use std::{collections::HashMap, env, net::IpAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpStream, UdpSocket},
     sync::{mpsc, Mutex},
     time::sleep,
 };
 fn valid_type(kind: &str) -> Result<()> {
-    if kind != "java" {
+    if kind != "java" && kind != "bedrock" {
         anyhow::bail!("unsupported Minecraft type: {kind}")
+    }
+    Ok(())
+}
+
+fn valid_transport(transport: &str) -> Result<()> {
+    if transport != "tcp" && transport != "udp" {
+        anyhow::bail!("unsupported transport: {transport}")
     }
     Ok(())
 }
@@ -41,7 +48,13 @@ async fn write_msg(s: &mut (impl AsyncWriteExt + Unpin), m: &Message) -> Result<
     s.write_all(&encode(m)?).await?;
     Ok(())
 }
-async fn run(endpoint: String, token: String, tunnel: String, destination: String) -> Result<()> {
+async fn run(
+    endpoint: String,
+    token: String,
+    tunnel: String,
+    destination: String,
+    transport: String,
+) -> Result<()> {
     valid_destination(&destination)?;
     let mut gateway = TcpStream::connect(endpoint).await?;
     write_msg(&mut gateway, &Message::Auth { token, tunnel }).await?;
@@ -69,7 +82,7 @@ async fn run(endpoint: String, token: String, tunnel: String, destination: Strin
     });
     loop {
         match read_msg(&mut rd).await? {
-            Message::Open { id } => {
+            Message::Open { id } if transport == "tcp" => {
                 let socket = TcpStream::connect(&destination).await;
                 match socket {
                     Ok(socket) => {
@@ -120,6 +133,49 @@ async fn run(endpoint: String, token: String, tunnel: String, destination: Strin
                 }
                 out_tx.send(Message::OpenOk { id }).await?;
             }
+            Message::OpenUdp { id } if transport == "udp" => {
+                let socket = match UdpSocket::bind("127.0.0.1:0").await {
+                    Ok(socket) => socket,
+                    Err(_) => {
+                        out_tx
+                            .send(Message::OpenError {
+                                id,
+                                reason: "UDP socket unavailable".into(),
+                            })
+                            .await?;
+                        continue;
+                    }
+                };
+                socket.connect(&destination).await?;
+                let socket = Arc::new(socket);
+                let (tx, mut rx) = mpsc::channel(64);
+                streams.lock().await.insert(id, tx);
+                let sender = out_tx.clone();
+                let receive_socket = socket.clone();
+                tokio::spawn(async move {
+                    let mut bytes = vec![0; MAX_DATAGRAM];
+                    while let Ok(n) = receive_socket.recv(&mut bytes).await {
+                        if sender
+                            .send(Message::Datagram {
+                                id,
+                                bytes: bytes[..n].to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Some(Message::Datagram { bytes, .. }) = rx.recv().await {
+                        if bytes.len() <= MAX_DATAGRAM && socket.send(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                out_tx.send(Message::OpenOk { id }).await?;
+            }
             Message::Data { id, bytes } => {
                 if let Some(tx) = streams.lock().await.get(&id) {
                     tx.send(Message::Data { id, bytes }).await?
@@ -142,13 +198,34 @@ async fn main() -> Result<()> {
     let tunnel = env::var("SHADOW_TUNNEL").unwrap_or_else(|_| "default".into());
     let minecraft_type = env::var("SHADOW_MINECRAFT_TYPE").unwrap_or_else(|_| "java".into());
     valid_type(&minecraft_type)?;
-    let destination = env::var("SHADOW_DESTINATION").unwrap_or_else(|_| "127.0.0.1:25565".into());
+    let default_transport = if minecraft_type == "bedrock" {
+        "udp"
+    } else {
+        "tcp"
+    };
+    let transport = env::var("SHADOW_TRANSPORT").unwrap_or_else(|_| default_transport.into());
+    valid_transport(&transport)?;
+    let expected_transport = if minecraft_type == "bedrock" {
+        "udp"
+    } else {
+        "tcp"
+    };
+    if transport != expected_transport {
+        anyhow::bail!("transport {transport} invalid for Minecraft type {minecraft_type}")
+    }
+    let default_destination = if minecraft_type == "bedrock" {
+        "127.0.0.1:19132"
+    } else {
+        "127.0.0.1:25565"
+    };
+    let destination = env::var("SHADOW_DESTINATION").unwrap_or_else(|_| default_destination.into());
     loop {
         if run(
             endpoint.clone(),
             token.clone(),
             tunnel.clone(),
             destination.clone(),
+            transport.clone(),
         )
         .await
         .is_ok()

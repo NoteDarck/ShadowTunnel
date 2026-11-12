@@ -1,5 +1,5 @@
 use anyhow::Result;
-use shadowtunnel_protocol::{decode, encode, Message, MAX_FRAME};
+use shadowtunnel_protocol::{decode, encode, Message, MAX_DATAGRAM, MAX_FRAME};
 use std::{
     collections::HashMap,
     env,
@@ -10,13 +10,14 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::{mpsc, RwLock},
 };
 
 #[derive(Clone)]
 struct Config {
     bind: String,
+    udp_bind: String,
     agent_bind: String,
     token: String,
     tls: bool,
@@ -34,6 +35,7 @@ impl Config {
         }
         Ok(Self {
             bind: env::var("SHADOW_PUBLIC_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into()),
+            udp_bind: env::var("SHADOW_PUBLIC_UDP_BIND").unwrap_or_else(|_| "0.0.0.0:19132".into()),
             agent_bind: env::var("SHADOW_AGENT_BIND").unwrap_or_else(|_| "0.0.0.0:9000".into()),
             token: env::var("SHADOW_TOKEN")?,
             tls,
@@ -93,7 +95,10 @@ fn msg_id(m: &Message) -> u32 {
         | Message::OpenOk { id }
         | Message::OpenError { id, .. }
         | Message::Data { id, .. }
-        | Message::Close { id } => *id,
+        | Message::Close { id }
+        | Message::OpenUdp { id }
+        | Message::Datagram { id, .. }
+        | Message::CloseUdp { id } => *id,
         _ => 0,
     }
 }
@@ -153,6 +158,77 @@ async fn public(
     up.abort();
     Ok(())
 }
+async fn public_udp(
+    socket: Arc<UdpSocket>,
+    registry: Registry,
+    pending: Pending,
+    ids: Arc<AtomicU32>,
+    tunnel: String,
+) -> Result<()> {
+    let mut clients = HashMap::new();
+    let mut buffer = vec![0; MAX_DATAGRAM];
+    loop {
+        let (n, address) = socket.recv_from(&mut buffer).await?;
+        if n > MAX_DATAGRAM {
+            continue;
+        }
+        let id = if let Some(id) = clients.get(&address) {
+            *id
+        } else {
+            if clients.len() >= 128 {
+                continue;
+            }
+            let agent = match registry.read().await.get(&tunnel).map(|a| a.tx.clone()) {
+                Some(agent) => agent,
+                None => continue,
+            };
+            let id = ids.fetch_add(1, Ordering::Relaxed);
+            let (tx, mut rx) = mpsc::channel(64);
+            pending.write().await.insert((tunnel.clone(), id), tx);
+            if agent.send(Message::OpenUdp { id }).await.is_err() {
+                pending.write().await.remove(&(tunnel.clone(), id));
+                continue;
+            }
+            let opened = matches!(rx.recv().await, Some(Message::OpenOk { .. }));
+            if !opened {
+                pending.write().await.remove(&(tunnel.clone(), id));
+                continue;
+            }
+            let reply_socket = socket.clone();
+            tokio::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    match message {
+                        Message::Datagram { bytes, .. } if bytes.len() <= MAX_DATAGRAM => {
+                            if reply_socket.send_to(&bytes, address).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::CloseUdp { .. } | Message::OpenError { .. } => break,
+                        _ => {}
+                    }
+                }
+            });
+            clients.insert(address, id);
+            id
+        };
+        let agent = match registry.read().await.get(&tunnel).map(|a| a.tx.clone()) {
+            Some(agent) => agent,
+            None => return Ok(()),
+        };
+        if agent
+            .send(Message::Datagram {
+                id,
+                bytes: buffer[..n].to_vec(),
+            })
+            .await
+            .is_err()
+        {
+            clients.remove(&address);
+            pending.write().await.remove(&(tunnel.clone(), id));
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
@@ -162,6 +238,7 @@ async fn main() -> Result<()> {
     let ids = Arc::new(AtomicU32::new(1));
     let agents = TcpListener::bind(&cfg.agent_bind).await?;
     let public_listener = TcpListener::bind(&cfg.bind).await?;
+    let udp_listener = Arc::new(UdpSocket::bind(&cfg.udp_bind).await?);
     let r = registry.clone();
     let p = pending.clone();
     let c = cfg.clone();
@@ -172,6 +249,13 @@ async fn main() -> Result<()> {
             }
         }
     });
+    tokio::spawn(public_udp(
+        udp_listener,
+        registry.clone(),
+        pending.clone(),
+        ids.clone(),
+        cfg.tunnel.clone(),
+    ));
     loop {
         let (s, _) = public_listener.accept().await?;
         tokio::spawn(public(

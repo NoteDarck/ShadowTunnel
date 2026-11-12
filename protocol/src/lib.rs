@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
+pub const MAX_DATAGRAM: usize = 1200;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -26,6 +27,9 @@ pub enum Message {
     OpenError { id: u32, reason: String },
     Data { id: u32, bytes: Vec<u8> },
     Close { id: u32 },
+    OpenUdp { id: u32 },
+    Datagram { id: u32, bytes: Vec<u8> },
+    CloseUdp { id: u32 },
 }
 
 pub fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
@@ -68,5 +72,14 @@ mod tests {
             decode(&[0, 0, 0, 4, 1]),
             Err(ProtocolError::InvalidLength)
         ));
+    }
+
+    #[test]
+    fn round_trip_datagram() {
+        let message = Message::Datagram {
+            id: 9,
+            bytes: vec![1, 2, 3],
+        };
+        assert_eq!(decode(&encode(&message).unwrap()).unwrap(), message);
     }
 }
