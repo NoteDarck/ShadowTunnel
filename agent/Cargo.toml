@@ -7,3 +7,5 @@ edition = "2021"
 shadowtunnel-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"

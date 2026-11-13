@@ -56,7 +56,11 @@ O script produz `dist\\shadowtunnel-agent-windows-x86_64.zip`; veja `packaging/w
 
 Variáveis do Agent: `SHADOW_TOKEN` (obrigatória), `SHADOW_GATEWAY`, `SHADOW_TUNNEL`, `SHADOW_MINECRAFT_TYPE`, `SHADOW_TRANSPORT` e `SHADOW_DESTINATION`. O destino aceita somente loopback. Use token longo e aleatório, permissões restritas no arquivo de ambiente e nunca registre tokens.
 
-Segurança TLS/API: o Gateway pode usar `SHADOW_TLS=1`, `SHADOW_TLS_CERT` e `SHADOW_TLS_KEY`; forneça certificados existentes e valide a cadeia no proxy/rede. O Agent atual conecta por TCP sem TLS próprio; não exponha a porta do Agent ou a API sem TLS, autenticação e firewall. Não inclua segredos em releases, logs ou commits.
+## TLS do canal Gateway-Agent
+
+TLS é opcional e não altera o transporte público TCP/UDP. O padrão permanece plaintext. No Gateway, defina `SHADOW_TLS=1`, `SHADOW_TLS_CERT=/caminho/cert.pem` e `SHADOW_TLS_KEY=/caminho/key.pem`; ambos são PEM existentes e obrigatórios. No Agent, defina `SHADOW_TLS=1`, `SHADOW_TLS_CA=/caminho/ca.pem` e `SHADOW_TLS_SERVER_NAME=gateway.example`; a CA e o nome DNS são validados. Os dois lados devem usar TLS simultaneamente. Sem essas variáveis, a conexão Agent permanece TCP plaintext.
+
+Não exponha a porta do Agent ou a API sem autenticação e firewall. Não inclua segredos em releases, logs ou commits.
 
 ## Verificação
 

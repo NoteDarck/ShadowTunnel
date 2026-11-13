@@ -1,12 +1,51 @@
 use anyhow::Result;
+use rustls::pki_types::ServerName;
 use shadowtunnel_protocol::{decode, encode, Message, MAX_DATAGRAM, MAX_FRAME};
-use std::{collections::HashMap, env, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, env, fs::File, io::BufReader, net::IpAddr, sync::Arc, time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     sync::{mpsc, Mutex},
     time::sleep,
 };
+use tokio_rustls::{rustls, TlsConnector};
+
+trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> AsyncStream for T {}
+
+async fn connect_gateway(
+    endpoint: String,
+    tls: bool,
+    ca: Option<String>,
+    server_name: Option<String>,
+) -> Result<Box<dyn AsyncStream>> {
+    let stream = TcpStream::connect(endpoint).await?;
+    if !tls {
+        return Ok(Box::new(stream));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let mut ca_reader = BufReader::new(File::open(
+        ca.ok_or_else(|| anyhow::anyhow!("SHADOW_TLS_CA required"))?,
+    )?);
+    let certs = rustls_pemfile::certs(&mut ca_reader);
+    for cert in certs {
+        roots.add(cert?)?;
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from(
+        server_name.ok_or_else(|| anyhow::anyhow!("SHADOW_TLS_SERVER_NAME required"))?,
+    )?
+    .to_owned();
+    Ok(Box::new(
+        TlsConnector::from(Arc::new(config))
+            .connect(name, stream)
+            .await?,
+    ))
+}
 fn valid_type(kind: &str) -> Result<()> {
     if kind != "java" && kind != "bedrock" {
         anyhow::bail!("unsupported Minecraft type: {kind}")
@@ -48,20 +87,24 @@ async fn write_msg(s: &mut (impl AsyncWriteExt + Unpin), m: &Message) -> Result<
     s.write_all(&encode(m)?).await?;
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 async fn run(
     endpoint: String,
     token: String,
     tunnel: String,
     destination: String,
     transport: String,
+    tls: bool,
+    ca: Option<String>,
+    server_name: Option<String>,
 ) -> Result<()> {
     valid_destination(&destination)?;
-    let mut gateway = TcpStream::connect(endpoint).await?;
+    let mut gateway = connect_gateway(endpoint, tls, ca, server_name).await?;
     write_msg(&mut gateway, &Message::Auth { token, tunnel }).await?;
     if read_msg(&mut gateway).await? != Message::AuthOk {
         anyhow::bail!("authentication failed")
     }
-    let (mut rd, mut wr) = gateway.into_split();
+    let (mut rd, mut wr) = tokio::io::split(gateway);
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(128);
     let _writer_handle = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
@@ -219,6 +262,12 @@ async fn main() -> Result<()> {
         "127.0.0.1:25565"
     };
     let destination = env::var("SHADOW_DESTINATION").unwrap_or_else(|_| default_destination.into());
+    let tls = env::var("SHADOW_TLS").unwrap_or_default() == "1";
+    let ca = env::var("SHADOW_TLS_CA").ok();
+    let server_name = env::var("SHADOW_TLS_SERVER_NAME").ok();
+    if tls && (ca.is_none() || server_name.is_none()) {
+        anyhow::bail!("TLS enabled but SHADOW_TLS_CA/SHADOW_TLS_SERVER_NAME missing")
+    }
     loop {
         if run(
             endpoint.clone(),
@@ -226,6 +275,9 @@ async fn main() -> Result<()> {
             tunnel.clone(),
             destination.clone(),
             transport.clone(),
+            tls,
+            ca.clone(),
+            server_name.clone(),
         )
         .await
         .is_ok()

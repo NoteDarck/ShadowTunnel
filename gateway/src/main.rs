@@ -11,16 +11,36 @@ use shadowtunnel_protocol::{decode, encode, Message, MAX_DATAGRAM, MAX_FRAME};
 use std::{
     collections::HashMap,
     env,
+    fs::File,
+    io::BufReader,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, UdpSocket},
     sync::{mpsc, RwLock},
 };
+use tokio_rustls::{rustls, TlsAcceptor};
+
+fn tls_acceptor(cert: &str, key: &str) -> Result<TlsAcceptor> {
+    let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert)?))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut key_reader = BufReader::new(File::open(key)?);
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
+    let key = keys
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no private key found"))??;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))?;
+    Ok(TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncStream for T {}
 
 #[derive(Clone)]
 struct Config {
@@ -228,7 +248,7 @@ async fn status(
     })
     .into_response()
 }
-async fn read_msg(s: &mut TcpStream) -> Result<Message> {
+async fn read_msg(s: &mut (impl AsyncRead + Unpin)) -> Result<Message> {
     let mut h = [0; 4];
     s.read_exact(&mut h).await?;
     let n = u32::from_be_bytes(h) as usize;
@@ -240,12 +260,12 @@ async fn read_msg(s: &mut TcpStream) -> Result<Message> {
     s.read_exact(&mut b[4..]).await?;
     Ok(decode(&b)?)
 }
-async fn write_msg(s: &mut TcpStream, m: &Message) -> Result<()> {
+async fn write_msg(s: &mut (impl AsyncWrite + Unpin), m: &Message) -> Result<()> {
     s.write_all(&encode(m)?).await?;
     Ok(())
 }
 async fn agent(
-    mut stream: TcpStream,
+    mut stream: impl AsyncStream,
     cfg: Config,
     registry: Registry,
     pending: Pending,
@@ -281,7 +301,7 @@ fn msg_id(m: &Message) -> u32 {
     }
 }
 async fn public(
-    stream: TcpStream,
+    stream: impl AsyncStream,
     registry: Registry,
     pending: Pending,
     ids: Arc<AtomicU32>,
@@ -305,7 +325,7 @@ async fn public(
         pending.write().await.remove(&(tunnel, id));
         anyhow::bail!("agent refused connection")
     }
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = tokio::io::split(stream);
     let a = agent.clone();
     let up = tokio::spawn(async move {
         let mut b = vec![0; MAX_FRAME / 2];
@@ -410,7 +430,14 @@ async fn public_udp(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
-    let _tls = (cfg.tls, cfg.cert.clone(), cfg.key.clone());
+    let tls_acceptor = if cfg.tls {
+        Some(tls_acceptor(
+            cfg.cert.as_deref().unwrap(),
+            cfg.key.as_deref().unwrap(),
+        )?)
+    } else {
+        None
+    };
     let registry = Arc::new(RwLock::new(HashMap::new()));
     let tunnel_state = Arc::new(RwLock::new(HashMap::from([(
         cfg.tunnel.clone(),
@@ -443,7 +470,14 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             if let Ok((s, _)) = agents.accept().await {
-                let _ = agent(s, c.clone(), r.clone(), p.clone()).await;
+                let stream = match &tls_acceptor {
+                    Some(acceptor) => match acceptor.accept(s).await {
+                        Ok(stream) => Box::new(stream) as Box<dyn AsyncStream>,
+                        Err(_) => continue,
+                    },
+                    None => Box::new(s) as Box<dyn AsyncStream>,
+                };
+                let _ = agent(stream, c.clone(), r.clone(), p.clone()).await;
             }
         }
     });
